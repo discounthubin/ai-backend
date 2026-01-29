@@ -33,7 +33,7 @@ app.post('/process-audio', upload.single('audio'), async (req, res) => {
         const base64Audio = fileBuffer.toString('base64');
 
         // 2. Ask Gemini for Timestamps
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
         
         const prompt = `
         You are a professional audio editor. 

@@ -1,85 +1,105 @@
-
-const express = require("express");
-const cors = require("cors"); // New: CORS import
-const fetch = require("node-fetch");
+const express = require('express');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
+const cors = require('cors');
+const ffmpeg = require('fluent-ffmpeg');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+require('dotenv').config();
 
 const app = express();
+app.use(cors());
 
-// 🔓 CORS CONFIGURATION (Frontend ko allow karne ke liye)
-app.use(cors({
-    origin: "*", // Filhal sabke liye allow kar rahe hain taki error na aaye
-    methods: ["GET", "POST"]
-}));
+// Upload setup (Temp storage)
+const upload = multer({ dest: 'uploads/' });
 
-app.use(express.json());
+// API Key from Environment Variables (Render settings se uthayega)
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
 
-// 🔐 CONFIG (API KEY)
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-
-// ✅ CORRECT Gemini HTTPS Model URL
-const GEMINI_MODEL_URL = 
-"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
-
-// Health check
-app.get("/", (req, res) => {
-    res.send("Node.js backend running 🚀");
+app.get('/', (req, res) => {
+    res.send('AI Audio Server is Running! 🚀');
 });
 
-// 🔥 MAIN AI ROUTE
-app.post("/generate", async (req, res) => {
+// Main Processing Route
+app.post('/process-audio', upload.single('audio'), async (req, res) => {
+    if (!req.file) return res.status(400).send('No file uploaded.');
+
+    const inputPath = req.file.path;
+    const outputPath = `uploads/output-${Date.now()}.mp3`;
+
     try {
-        const userPrompt = req.body.prompt;
+        // 1. Read File for Gemini
+        const fileBuffer = fs.readFileSync(inputPath);
+        const base64Audio = fileBuffer.toString('base64');
 
-        if (!userPrompt) {
-            return res.status(400).json({ error: "Prompt is required" });
+        // 2. Ask Gemini for Timestamps
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        
+        const prompt = `
+        You are a professional audio editor. 
+        Context: The user speaks in Hindi/Hinglish and makes multiple retakes.
+        Task: Identify ONLY the timestamps of the FINAL PERFECT TAKE for each sentence.
+        Ignore stammers, retakes, silence, and angry outbursts.
+        
+        STRICT OUTPUT FORMAT (JSON ONLY):
+        {
+          "segments": [
+            {"start": "00:00:05", "end": "00:00:10"},
+            {"start": "00:00:15", "end": "00:00:25"}
+          ]
+        }
+        `;
+
+        const result = await model.generateContent([
+            prompt,
+            { inlineData: { data: base64Audio, mimeType: "audio/mp3" } }
+        ]);
+
+        const responseText = result.response.text();
+        // Clean markdown if present
+        const jsonStr = responseText.replace(/```json|```/g, '').trim();
+        const segments = JSON.parse(jsonStr).segments;
+
+        console.log("Segments to keep:", segments);
+
+        if (!segments || segments.length === 0) {
+            throw new Error("No valid segments found by AI");
         }
 
-        const geminiResponse = await fetch(
-            `${GEMINI_MODEL_URL}?key=${GEMINI_API_KEY}`,
-            {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                    contents: [
-                        {
-                            parts: [{ text: userPrompt }]
-                        }
-                    ]
-                })
-            }
-        );
-
-        const data = await geminiResponse.json();
-
-        // Check if Gemini returned an error
-        if (data.error) {
-            console.error("Gemini API Error:", data.error);
-            return res.status(500).json({ success: false, error: data.error.message });
-        }
-
-        // Extract text correctly based on Gemini response structure
-        let aiText = "No response text found.";
-        if (data.candidates && data.candidates[0].content && data.candidates[0].content.parts) {
-            aiText = data.candidates[0].content.parts[0].text;
-        }
-
-        res.json({
-            success: true,
-            response: aiText
+        // 3. Process with FFmpeg (Server Side)
+        // Construct Complex Filter for trimming and merging
+        const filterComplex = segments.map((seg, i) => {
+            return `[0:a]trim=start=${seg.start}:end=${seg.end},asetpts=PTS-STARTPTS[a${i}]`;
         });
+        
+        const inputs = segments.map((_, i) => `[a${i}]`).join('');
+        const complexFilterString = `${filterComplex.join(';')};${inputs}concat=n=${segments.length}:v=0:a=1[out]`;
+
+        ffmpeg(inputPath)
+            .complexFilter(complexFilterString)
+            .map('[out]')
+            .on('end', () => {
+                console.log('Processing finished!');
+                // Send file back to user
+                res.download(outputPath, 'edited-audio.mp3', (err) => {
+                    // Cleanup files after sending
+                    if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+                    if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+                });
+            })
+            .on('error', (err) => {
+                console.error('FFmpeg Error:', err);
+                res.status(500).send('Audio Processing Failed');
+            })
+            .save(outputPath);
 
     } catch (error) {
-        console.error("Server Error:", error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        console.error(error);
+        res.status(500).send('Error: ' + error.message);
+        // Cleanup on error
+        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
     }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server started on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

@@ -10,7 +10,7 @@ require('dotenv').config();
 const app = express();
 app.use(cors());
 
-// --- 1. UPLOAD CONFIGURATION ---
+// --- UPLOAD CONFIG ---
 const upload = multer({ 
     storage: multer.diskStorage({
         destination: (req, file, cb) => {
@@ -25,10 +25,11 @@ const upload = multer({
 });
 
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
+const BUFFER_TIME = 0.15; // 0.15s extra padding before/after cuts
 
 app.get('/', (req, res) => res.send('AI Audio Server is ONLINE 🟢'));
 
-// --- HELPER: GET AUDIO DURATION ---
+// --- HELPER: GET DURATION ---
 function getAudioDuration(filePath) {
     return new Promise((resolve, reject) => {
         ffmpeg.ffprobe(filePath, (err, metadata) => {
@@ -38,129 +39,89 @@ function getAudioDuration(filePath) {
     });
 }
 
-// --- HELPER: CUT A SINGLE CHUNK ---
-function cutSegment(inputFile, start, end, index) {
-    return new Promise((resolve, reject) => {
-        const outputFile = `uploads/chunk_${index}_${Date.now()}.mp3`;
-        // Use simple seek and copy (Fast & Crash Proof)
-        ffmpeg(inputFile)
-            .setStartTime(start)
-            .setDuration(end - start)
-            .audioCodec('libmp3lame') // Re-encode to ensure consistency
-            .on('end', () => resolve(outputFile))
-            .on('error', (err) => reject(err))
-            .save(outputFile);
-    });
-}
-
-// --- HELPER: MERGE FILES ---
-function mergeChunks(chunkFiles, finalOutput) {
-    return new Promise((resolve, reject) => {
-        const merged = ffmpeg();
-        chunkFiles.forEach(file => merged.input(file));
-        
-        merged.on('end', () => resolve(finalOutput))
-            .on('error', (err) => reject(err))
-            .mergeToFile(finalOutput, 'uploads/'); // Temp folder for merge
-    });
-}
-
-// --- 2. MAIN PROCESSING ---
+// --- MAIN PROCESS ---
 app.post('/process-audio', upload.single('audio'), async (req, res) => {
     if (!req.file) return res.status(400).send('No file uploaded.');
 
     const inputPath = req.file.path;
     const finalOutputPath = `uploads/final-${Date.now()}.mp3`;
-    let chunkPaths = [];
+    let tempFiles = [];
 
     try {
         console.log(`[Start] Processing: ${req.file.originalname}`);
-
-        // A. Duration Check (Taaki AI file se bada time na de)
         const totalDuration = await getAudioDuration(inputPath);
-        console.log(`[Info] File Duration: ${totalDuration}s`);
 
-        // B. AI Analysis
+        // 1. AI Analysis
         const fileBuffer = fs.readFileSync(inputPath);
         const base64Audio = fileBuffer.toString('base64');
-        
-        // MimeType Fix
-        let mimeType = req.file.mimetype;
-        const ext = path.extname(req.file.originalname).toLowerCase();
-        if (['.mp3', '.wav', '.aac', '.m4a'].includes(ext)) {
-            mimeType = ext === '.m4a' ? 'audio/m4a' : `audio/${ext.substring(1)}`;
-        }
-
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-        const prompt = `
-        You are an expert audio editor.
-        Task: Identify start/end times of the FINAL PERFECT TAKE for each sentence.
-        Input Audio Duration: ${totalDuration} seconds.
-        
-        CRITICAL:
-        1. Output strictly in DECIMAL SECONDS (e.g., 5.432).
-        2. Do NOT provide timestamps greater than ${totalDuration}.
-        3. Output RAW JSON ONLY.
 
-        FORMAT:
-        { "segments": [ {"start": 1.2, "end": 4.5} ] }
+        const prompt = `
+        You are a professional audio editor editing a voiceover.
+        Context: The user repeats lines. You must keep ONLY the BEST/LAST take of each sentence.
+        
+        RULES:
+        1. If a sentence is repeated 3 times, keep ONLY the 3rd one. DELETE the first two.
+        2. Merge short pauses, but do not include long silence.
+        3. Output strictly in DECIMAL SECONDS.
+        
+        FORMAT: { "segments": [ {"start": 1.2, "end": 4.5}, {"start": 6.8, "end": 10.1} ] }
         `;
 
         console.log("[AI] Analyzing...");
         const result = await model.generateContent([
             prompt,
-            { inlineData: { data: base64Audio, mimeType: mimeType } }
+            { inlineData: { data: base64Audio, mimeType: "audio/mp3" } } // Assuming MP3 conversion done
         ]);
 
         const responseText = result.response.text();
-        
-        // C. JSON Cleaner
         let jsonStr = responseText.replace(/```json|```/g, '');
         const firstBrace = jsonStr.indexOf('{');
         const lastBrace = jsonStr.lastIndexOf('}');
         if (firstBrace !== -1 && lastBrace !== -1) jsonStr = jsonStr.substring(firstBrace, lastBrace + 1);
+
+        let segments = JSON.parse(jsonStr).segments;
+
+        // 2. Add Buffer (Padding) to prevent cutting words
+        const bufferedSegments = segments.map(s => ({
+            start: Math.max(0, s.start - BUFFER_TIME), // Thoda pehle shuru karo
+            end: Math.min(totalDuration, s.end + BUFFER_TIME) // Thoda baad mein khatam karo
+        })).sort((a, b) => a.start - b.start);
+
+        // 3. Cut & Crossfade Logic (Using Complex Filter)
+        console.log(`[FFmpeg] Cutting ${bufferedSegments.length} parts with Crossfade...`);
         
-        let segments = [];
-        try {
-            segments = JSON.parse(jsonStr).segments;
-        } catch (e) {
-            throw new Error("AI returned invalid Data.");
-        }
+        // Note: For true crossfade on Render free tier, it's heavy. 
+        // We will stick to "Concat" but with buffer, which sounds much smoother.
+        
+        const filterStr = bufferedSegments.map((seg, i) => 
+            `[0:a]trim=start=${seg.start.toFixed(3)}:end=${seg.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`
+        ).join(';');
 
-        // D. Validate Segments
-        const validSegments = segments
-            .map(s => ({ start: parseFloat(s.start), end: parseFloat(s.end) }))
-            .filter(s => !isNaN(s.start) && !isNaN(s.end) && s.end > s.start && s.start < totalDuration)
-            .sort((a, b) => a.start - b.start);
+        const concatStr = bufferedSegments.map((_, i) => `[a${i}]`).join('') + 
+                          `concat=n=${bufferedSegments.length}:v=0:a=1[out]`;
 
-        if (validSegments.length === 0) throw new Error("No valid segments found.");
+        const complexFilter = `${filterStr};${concatStr}`;
 
-        // E. THE NEW STRATEGY: Chunk & Stitch
-        console.log(`[Processing] Creating ${validSegments.length} chunks...`);
-
-        // Loop: Cut each segment one by one (Sequential to save RAM)
-        for (let i = 0; i < validSegments.length; i++) {
-            const seg = validSegments[i];
-            // Safety: Ensure end doesn't exceed total duration
-            const safeEnd = Math.min(seg.end, totalDuration);
-            
-            console.log(`  -> Cutting Chunk ${i+1}: ${seg.start}s to ${safeEnd}s`);
-            const chunkPath = await cutSegment(inputPath, seg.start, safeEnd, i);
-            chunkPaths.push(chunkPath);
-        }
-
-        console.log(`[Processing] Merging ${chunkPaths.length} chunks...`);
-        await mergeChunks(chunkPaths, finalOutputPath);
-
-        console.log("✅ Success! Sending file.");
-        res.download(finalOutputPath, 'cleaned_audio.mp3', () => {
-            cleanup(inputPath, finalOutputPath, ...chunkPaths);
-        });
+        ffmpeg(inputPath)
+            .complexFilter(complexFilter)
+            .map('[out]')
+            .audioCodec('libmp3lame')
+            .on('end', () => {
+                console.log("✅ Success!");
+                res.download(finalOutputPath, 'polished_audio.mp3', () => cleanup(inputPath, finalOutputPath));
+            })
+            .on('error', (err) => {
+                console.error("FFmpeg Error:", err.message);
+                res.status(500).send("Processing Failed");
+                cleanup(inputPath, finalOutputPath);
+            })
+            .save(finalOutputPath);
 
     } catch (error) {
-        console.error("Server Error:", error.message);
-        res.status(500).send("Error: " + error.message);
-        cleanup(inputPath, finalOutputPath, ...chunkPaths);
+        console.error("Error:", error.message);
+        res.status(500).send(error.message);
+        cleanup(inputPath);
     }
 });
 

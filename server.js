@@ -52,7 +52,7 @@ app.post('/process-audio', upload.single('audio'), async (req, res) => {
 
         // 2. Ask Gemini (New Prompt for Seconds)
         console.log(`[2/4] Sending to AI (Mime: ${mimeType})...`);
-        const model = genAI.getGenerativeModel({ model: "gemini-3-flash" });
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
         
         const prompt = `
         You are an expert audio editor.

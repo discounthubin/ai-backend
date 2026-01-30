@@ -10,7 +10,7 @@ require('dotenv').config();
 const app = express();
 app.use(cors());
 
-// --- 1. UPLOAD SETUP (Temp Storage) ---
+// --- 1. UPLOAD CONFIGURATION ---
 const upload = multer({ 
     storage: multer.diskStorage({
         destination: (req, file, cb) => {
@@ -38,29 +38,32 @@ app.post('/process-audio', upload.single('audio'), async (req, res) => {
     try {
         console.log(`[Start] Processing: ${req.file.originalname}`);
 
-        // A. File Read & MimeType Fix
+        // A. File Read & MimeType Fix (AAC/M4A Fix)
         const fileBuffer = fs.readFileSync(inputPath);
         const base64Audio = fileBuffer.toString('base64');
         
         let mimeType = req.file.mimetype;
         const ext = path.extname(req.file.originalname).toLowerCase();
-        if (['.mp3', '.wav', '.aac', '.m4a'].includes(ext)) {
-            mimeType = ext === '.m4a' ? 'audio/m4a' : `audio/${ext.substring(1)}`;
-        }
+        // Force correct MIME types for mobile uploads
+        if (ext === '.mp3') mimeType = 'audio/mp3';
+        else if (ext === '.wav') mimeType = 'audio/wav';
+        else if (ext === '.aac') mimeType = 'audio/aac';
+        else if (ext === '.m4a') mimeType = 'audio/m4a';
 
-        // B. AI CONFIGURATION (THE MILLISECOND FIX)
-        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+        console.log(`[Info] MimeType detected: ${mimeType}`);
+
+        // B. AI CONFIGURATION (Strict Seconds & JSON)
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
         
-        // Is PROMPT mein magic hai. Hum strict seconds maang rahe hain.
         const prompt = `
         You are an expert audio editor.
         Context: The user records retakes. Only the LAST take of a sentence is good.
         Task: Identify start/end times of the FINAL PERFECT TAKE for each sentence.
         
-        CRITICAL INSTRUCTION:
-        - Output strictly in DECIMAL SECONDS (e.g., 5.432), NOT HH:MM:SS.
-        - Be precise to the millisecond.
-        - Ignore silence/retakes.
+        CRITICAL INSTRUCTIONS:
+        1. Output strictly in DECIMAL SECONDS (e.g., 5.432), NOT HH:MM:SS.
+        2. Be precise to the millisecond.
+        3. Output RAW JSON ONLY. Do not write "Here is the json" or use markdown blocks.
 
         STRICT JSON FORMAT:
         {
@@ -78,35 +81,51 @@ app.post('/process-audio', upload.single('audio'), async (req, res) => {
         ]);
 
         const responseText = result.response.text();
-        const jsonStr = responseText.replace(/```json|```/g, '').trim();
+        // console.log("Raw AI Response:", responseText); // Debugging line
+
+        // --- C. ROBUST JSON CLEANER (The Fix for 'JSON Failed') ---
+        let jsonStr = responseText;
         
+        // Step 1: Remove Markdown code blocks (```json ... ```)
+        jsonStr = jsonStr.replace(/```json|```/g, '');
+        
+        // Step 2: Find the first '{' and last '}' to ignore extra text
+        const firstBrace = jsonStr.indexOf('{');
+        const lastBrace = jsonStr.lastIndexOf('}');
+        
+        if (firstBrace !== -1 && lastBrace !== -1) {
+            jsonStr = jsonStr.substring(firstBrace, lastBrace + 1);
+        }
+        // -----------------------------------------------------------
+
         let segments = [];
         try {
             segments = JSON.parse(jsonStr).segments;
         } catch (e) {
-            throw new Error(`AI JSON Failed. Response: ${responseText.substring(0, 50)}...`);
+            console.error("JSON Parsing Failed on:", jsonStr);
+            throw new Error(`AI returned invalid Data. Raw: ${responseText.substring(0, 50)}...`);
         }
 
         if (!segments || segments.length === 0) {
-            throw new Error("AI found no valid segments.");
+            throw new Error("AI found no valid segments to keep.");
         }
 
-        // C. VALIDATION (Crash Proofing)
+        // D. VALIDATION (Crash Proofing)
         console.log(`[AI] Found ${segments.length} segments. Validating...`);
         
         const validSegments = segments.map(s => ({
-            start: parseFloat(s.start), // Text ko Number banana
+            start: parseFloat(s.start),
             end: parseFloat(s.end)
         })).filter(s => 
             !isNaN(s.start) && !isNaN(s.end) && s.end > s.start
         ).sort((a, b) => a.start - b.start);
 
-        if (validSegments.length === 0) throw new Error("No valid timestamps found.");
+        if (validSegments.length === 0) throw new Error("No valid timestamps found (Start > End error).");
 
-        // D. FFmpeg PRECISE CUTTING
-        console.log(`[FFmpeg] Cutting with Millisecond Precision...`);
+        // E. FFmpeg PROCESSING
+        console.log(`[FFmpeg] Cutting ${validSegments.length} parts...`);
 
-        // Filter Logic: trim=start=1.234:end=5.678
+        // Create filter string: [0:a]trim=start=1.234:end=5.678,asetpts=PTS-STARTPTS[a0];
         const filterStr = validSegments.map((seg, i) => 
             `[0:a]trim=start=${seg.start.toFixed(3)}:end=${seg.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`
         ).join(';');
@@ -121,7 +140,8 @@ app.post('/process-audio', upload.single('audio'), async (req, res) => {
             .map('[out]')
             .on('end', () => {
                 console.log("✅ DONE! Sending file.");
-                res.download(outputPath, 'edited_audio.mp3', () => {
+                res.download(outputPath, 'edited_audio.mp3', (err) => {
+                    if(err) console.error("Download Error:", err);
                     cleanup(inputPath, outputPath);
                 });
             })
@@ -139,10 +159,12 @@ app.post('/process-audio', upload.single('audio'), async (req, res) => {
     }
 });
 
-// Helper to delete files
+// Helper to delete files safely
 function cleanup(...files) {
     files.forEach(f => {
-        if (f && fs.existsSync(f)) try { fs.unlinkSync(f); } catch(e){}
+        if (f && fs.existsSync(f)) {
+            try { fs.unlinkSync(f); } catch(e){ console.error("Cleanup Error:", e); }
+        }
     });
 }
 

@@ -56,7 +56,7 @@ app.post('/process-audio', upload.single('audio'), async (req, res) => {
         }
 
         // 3. Call Gemini
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
         const prompt = `
         You are a professional audio editor for a Hindi/Hinglish creator.
         Context: The user records multiple takes.

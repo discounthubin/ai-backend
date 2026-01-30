@@ -18,8 +18,8 @@ const upload = multer({
             cb(null, 'uploads/')
         },
         filename: (req, file, cb) => {
-            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-            cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+            const ext = path.extname(file.originalname);
+            cb(null, `raw-${Date.now()}${ext}`); 
         }
     })
 });
@@ -28,143 +28,145 @@ const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
 
 app.get('/', (req, res) => res.send('AI Audio Server is ONLINE 🟢'));
 
-// --- 2. MAIN PROCESSING ROUTE ---
+// --- HELPER: GET AUDIO DURATION ---
+function getAudioDuration(filePath) {
+    return new Promise((resolve, reject) => {
+        ffmpeg.ffprobe(filePath, (err, metadata) => {
+            if (err) return reject(err);
+            resolve(metadata.format.duration);
+        });
+    });
+}
+
+// --- HELPER: CUT A SINGLE CHUNK ---
+function cutSegment(inputFile, start, end, index) {
+    return new Promise((resolve, reject) => {
+        const outputFile = `uploads/chunk_${index}_${Date.now()}.mp3`;
+        // Use simple seek and copy (Fast & Crash Proof)
+        ffmpeg(inputFile)
+            .setStartTime(start)
+            .setDuration(end - start)
+            .audioCodec('libmp3lame') // Re-encode to ensure consistency
+            .on('end', () => resolve(outputFile))
+            .on('error', (err) => reject(err))
+            .save(outputFile);
+    });
+}
+
+// --- HELPER: MERGE FILES ---
+function mergeChunks(chunkFiles, finalOutput) {
+    return new Promise((resolve, reject) => {
+        const merged = ffmpeg();
+        chunkFiles.forEach(file => merged.input(file));
+        
+        merged.on('end', () => resolve(finalOutput))
+            .on('error', (err) => reject(err))
+            .mergeToFile(finalOutput, 'uploads/'); // Temp folder for merge
+    });
+}
+
+// --- 2. MAIN PROCESSING ---
 app.post('/process-audio', upload.single('audio'), async (req, res) => {
     if (!req.file) return res.status(400).send('No file uploaded.');
 
     const inputPath = req.file.path;
-    const outputPath = `uploads/output-${Date.now()}.mp3`;
+    const finalOutputPath = `uploads/final-${Date.now()}.mp3`;
+    let chunkPaths = [];
 
     try {
         console.log(`[Start] Processing: ${req.file.originalname}`);
 
-        // A. File Read & MimeType Fix (AAC/M4A Fix)
+        // A. Duration Check (Taaki AI file se bada time na de)
+        const totalDuration = await getAudioDuration(inputPath);
+        console.log(`[Info] File Duration: ${totalDuration}s`);
+
+        // B. AI Analysis
         const fileBuffer = fs.readFileSync(inputPath);
         const base64Audio = fileBuffer.toString('base64');
         
+        // MimeType Fix
         let mimeType = req.file.mimetype;
         const ext = path.extname(req.file.originalname).toLowerCase();
-        // Force correct MIME types for mobile uploads
-        if (ext === '.mp3') mimeType = 'audio/mp3';
-        else if (ext === '.wav') mimeType = 'audio/wav';
-        else if (ext === '.aac') mimeType = 'audio/aac';
-        else if (ext === '.m4a') mimeType = 'audio/m4a';
+        if (['.mp3', '.wav', '.aac', '.m4a'].includes(ext)) {
+            mimeType = ext === '.m4a' ? 'audio/m4a' : `audio/${ext.substring(1)}`;
+        }
 
-        console.log(`[Info] MimeType detected: ${mimeType}`);
-
-        // B. AI CONFIGURATION (Strict Seconds & JSON)
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-        
         const prompt = `
         You are an expert audio editor.
-        Context: The user records retakes. Only the LAST take of a sentence is good.
         Task: Identify start/end times of the FINAL PERFECT TAKE for each sentence.
+        Input Audio Duration: ${totalDuration} seconds.
         
-        CRITICAL INSTRUCTIONS:
-        1. Output strictly in DECIMAL SECONDS (e.g., 5.432), NOT HH:MM:SS.
-        2. Be precise to the millisecond.
-        3. Output RAW JSON ONLY. Do not write "Here is the json" or use markdown blocks.
+        CRITICAL:
+        1. Output strictly in DECIMAL SECONDS (e.g., 5.432).
+        2. Do NOT provide timestamps greater than ${totalDuration}.
+        3. Output RAW JSON ONLY.
 
-        STRICT JSON FORMAT:
-        {
-          "segments": [
-            {"start": 1.253, "end": 4.501},
-            {"start": 6.100, "end": 12.854}
-          ]
-        }
+        FORMAT:
+        { "segments": [ {"start": 1.2, "end": 4.5} ] }
         `;
 
-        console.log("[AI] Analyzing Audio...");
+        console.log("[AI] Analyzing...");
         const result = await model.generateContent([
             prompt,
             { inlineData: { data: base64Audio, mimeType: mimeType } }
         ]);
 
         const responseText = result.response.text();
-        // console.log("Raw AI Response:", responseText); // Debugging line
-
-        // --- C. ROBUST JSON CLEANER (The Fix for 'JSON Failed') ---
-        let jsonStr = responseText;
         
-        // Step 1: Remove Markdown code blocks (```json ... ```)
-        jsonStr = jsonStr.replace(/```json|```/g, '');
-        
-        // Step 2: Find the first '{' and last '}' to ignore extra text
+        // C. JSON Cleaner
+        let jsonStr = responseText.replace(/```json|```/g, '');
         const firstBrace = jsonStr.indexOf('{');
         const lastBrace = jsonStr.lastIndexOf('}');
+        if (firstBrace !== -1 && lastBrace !== -1) jsonStr = jsonStr.substring(firstBrace, lastBrace + 1);
         
-        if (firstBrace !== -1 && lastBrace !== -1) {
-            jsonStr = jsonStr.substring(firstBrace, lastBrace + 1);
-        }
-        // -----------------------------------------------------------
-
         let segments = [];
         try {
             segments = JSON.parse(jsonStr).segments;
         } catch (e) {
-            console.error("JSON Parsing Failed on:", jsonStr);
-            throw new Error(`AI returned invalid Data. Raw: ${responseText.substring(0, 50)}...`);
+            throw new Error("AI returned invalid Data.");
         }
 
-        if (!segments || segments.length === 0) {
-            throw new Error("AI found no valid segments to keep.");
+        // D. Validate Segments
+        const validSegments = segments
+            .map(s => ({ start: parseFloat(s.start), end: parseFloat(s.end) }))
+            .filter(s => !isNaN(s.start) && !isNaN(s.end) && s.end > s.start && s.start < totalDuration)
+            .sort((a, b) => a.start - b.start);
+
+        if (validSegments.length === 0) throw new Error("No valid segments found.");
+
+        // E. THE NEW STRATEGY: Chunk & Stitch
+        console.log(`[Processing] Creating ${validSegments.length} chunks...`);
+
+        // Loop: Cut each segment one by one (Sequential to save RAM)
+        for (let i = 0; i < validSegments.length; i++) {
+            const seg = validSegments[i];
+            // Safety: Ensure end doesn't exceed total duration
+            const safeEnd = Math.min(seg.end, totalDuration);
+            
+            console.log(`  -> Cutting Chunk ${i+1}: ${seg.start}s to ${safeEnd}s`);
+            const chunkPath = await cutSegment(inputPath, seg.start, safeEnd, i);
+            chunkPaths.push(chunkPath);
         }
 
-        // D. VALIDATION (Crash Proofing)
-        console.log(`[AI] Found ${segments.length} segments. Validating...`);
-        
-        const validSegments = segments.map(s => ({
-            start: parseFloat(s.start),
-            end: parseFloat(s.end)
-        })).filter(s => 
-            !isNaN(s.start) && !isNaN(s.end) && s.end > s.start
-        ).sort((a, b) => a.start - b.start);
+        console.log(`[Processing] Merging ${chunkPaths.length} chunks...`);
+        await mergeChunks(chunkPaths, finalOutputPath);
 
-        if (validSegments.length === 0) throw new Error("No valid timestamps found (Start > End error).");
-
-        // E. FFmpeg PROCESSING
-        console.log(`[FFmpeg] Cutting ${validSegments.length} parts...`);
-
-        // Create filter string: [0:a]trim=start=1.234:end=5.678,asetpts=PTS-STARTPTS[a0];
-        const filterStr = validSegments.map((seg, i) => 
-            `[0:a]trim=start=${seg.start.toFixed(3)}:end=${seg.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`
-        ).join(';');
-
-        const concatStr = validSegments.map((_, i) => `[a${i}]`).join('') + 
-                          `concat=n=${validSegments.length}:v=0:a=1[out]`;
-
-        const complexFilter = `${filterStr};${concatStr}`;
-
-        ffmpeg(inputPath)
-            .complexFilter(complexFilter)
-            .map('[out]')
-            .on('end', () => {
-                console.log("✅ DONE! Sending file.");
-                res.download(outputPath, 'edited_audio.mp3', (err) => {
-                    if(err) console.error("Download Error:", err);
-                    cleanup(inputPath, outputPath);
-                });
-            })
-            .on('error', (err) => {
-                console.error("❌ FFmpeg Failed:", err.message);
-                res.status(500).send("Audio Processing Failed inside FFmpeg.");
-                cleanup(inputPath, outputPath);
-            })
-            .save(outputPath);
+        console.log("✅ Success! Sending file.");
+        res.download(finalOutputPath, 'cleaned_audio.mp3', () => {
+            cleanup(inputPath, finalOutputPath, ...chunkPaths);
+        });
 
     } catch (error) {
-        console.error("❌ SERVER ERROR:", error.message);
+        console.error("Server Error:", error.message);
         res.status(500).send("Error: " + error.message);
-        if (req.file) cleanup(req.file.path);
+        cleanup(inputPath, finalOutputPath, ...chunkPaths);
     }
 });
 
-// Helper to delete files safely
 function cleanup(...files) {
     files.forEach(f => {
-        if (f && fs.existsSync(f)) {
-            try { fs.unlinkSync(f); } catch(e){ console.error("Cleanup Error:", e); }
-        }
+        if (f && fs.existsSync(f)) try { fs.unlinkSync(f); } catch(e){}
     });
 }
 

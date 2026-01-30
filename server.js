@@ -53,7 +53,7 @@ app.post('/process-audio', upload.single('audio'), async (req, res) => {
         console.log(`[Info] MimeType detected: ${mimeType}`);
 
         // B. AI CONFIGURATION (Strict Seconds & JSON)
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
         
         const prompt = `
         You are an expert audio editor.

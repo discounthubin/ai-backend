@@ -49,7 +49,7 @@ app.post('/process-audio', upload.single('audio'), async (req, res) => {
         }
 
         // B. AI CONFIGURATION (THE MILLISECOND FIX)
-        const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
         
         // Is PROMPT mein magic hai. Hum strict seconds maang rahe hain.
         const prompt = `

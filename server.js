@@ -88,7 +88,7 @@ app.post('/process-audio', upload.single('audio'), async (req, res) => {
         // 1. AI Analysis
         const fileBuffer = fs.readFileSync(inputPath);
         const base64Audio = fileBuffer.toString('base64');
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
         // --- THE "SEMANTIC BRAIN" PROMPT ---
         const prompt = `

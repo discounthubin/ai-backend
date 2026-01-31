@@ -196,7 +196,7 @@ function cleanup(...files) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));3; // 0.12s extra start/end mein (Words katna band ho jayega)
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));1.8; // 0.12s extra start/end mein (Words katna band ho jayega)
 
 app.get('/', (req, res) => res.send('AI Audio Server is ONLINE 🟢'));
 

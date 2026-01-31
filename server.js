@@ -27,8 +27,8 @@ const upload = multer({
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
 
 // --- PRO SETTINGS (Smoothness) ---
-const PADDING_START = 0.3; // 0.3s (Requested: Words ka start nahi katega)
-const PADDING_END = 0.2;   // 0.2s (End mein saans lene ki awaz safe rahegi)
+const PADDING_START = 0.19; // 0.3s (Requested: Words ka start nahi katega)
+const PADDING_END = 0.18;   // 0.2s (End mein saans lene ki awaz safe rahegi)
 
 app.get('/', (req, res) => res.send('AI Audio Server PRO is ONLINE 🟢'));
 

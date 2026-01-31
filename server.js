@@ -25,7 +25,7 @@ const upload = multer({
 });
 
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
-const PADDING = 0.12; // 0.12s extra start/end mein (Words katna band ho jayega)
+const PADDING = 0.5; // 0.12s extra start/end mein (Words katna band ho jayega)
 
 app.get('/', (req, res) => res.send('AI Audio Server is ONLINE 🟢'));
 

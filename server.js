@@ -10,7 +10,7 @@ require('dotenv').config();
 const app = express();
 app.use(cors());
 
-// --- UPLOAD CONFIG (SAME AS BEFORE) ---
+// --- UPLOAD CONFIG ---
 const upload = multer({ 
     storage: multer.diskStorage({
         destination: (req, file, cb) => {
@@ -26,12 +26,13 @@ const upload = multer({
 
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
 
-// --- DYNAMIC PADDING SETTINGS (NEW) ---
-const PAD_START_DEFAULT = 0.25; // Default safe start
-const PAD_END_FLOW = 0.05;      // Very tight cut for "Flow" (aur, lekin...)
-const PAD_END_STOP = 0.25;      // Relaxed cut for "Stop" (full stop)
+// --- YOUR EDITING STYLE SETTINGS ---
+// Aapke edit mein cuts tight the, par natural.
+const PAD_START = 0.15; // Attack safe rakhne ke liye
+const PAD_END_FLOW = 0.08; // Tight cut for flow
+const PAD_END_STOP = 0.3; // Saans lene ki jagah
 
-app.get('/', (req, res) => res.send('AI Audio Server MASTERCLASS is ONLINE 🟢'));
+app.get('/', (req, res) => res.send('AI Audio Server (Waveform Smart) is ONLINE 🟢'));
 
 // --- HELPER: GET DURATION ---
 function getAudioDuration(filePath) {
@@ -43,16 +44,13 @@ function getAudioDuration(filePath) {
     });
 }
 
-// --- HELPER: CUT CHUNK (UPDATED FOR DYNAMIC PADDING) ---
+// --- HELPER: CUT CHUNK (Smart Padding) ---
 function cutSegment(inputFile, start, end, type, index) {
     return new Promise((resolve, reject) => {
         const outputFile = `uploads/chunk_${index}_${Date.now()}.mp3`;
         
-        // 1. Determine Padding based on AI's "type"
         let endPadding = (type === 'flow') ? PAD_END_FLOW : PAD_END_STOP;
-        
-        // 2. Logic: Safe Start + Dynamic End
-        let safeStart = Math.max(0, start - PAD_START_DEFAULT);
+        let safeStart = Math.max(0, start - PAD_START);
         let duration = (end + endPadding) - safeStart;
 
         ffmpeg(inputFile)
@@ -65,12 +63,11 @@ function cutSegment(inputFile, start, end, type, index) {
     });
 }
 
-// --- HELPER: MERGE CHUNKS (SAME AS BEFORE) ---
+// --- HELPER: MERGE CHUNKS ---
 function mergeChunks(chunkFiles, finalOutput) {
     return new Promise((resolve, reject) => {
         const merged = ffmpeg();
         chunkFiles.forEach(file => merged.input(file));
-        
         merged.on('end', () => resolve(finalOutput))
             .on('error', (err) => reject(err))
             .mergeToFile(finalOutput, 'uploads/');
@@ -94,30 +91,36 @@ app.post('/process-audio', upload.single('audio'), async (req, res) => {
         const base64Audio = fileBuffer.toString('base64');
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-        // --- THE "MASTERCLASS FLOW" PROMPT ---
+        // --- THE "AUDIO ENGINEER" PROMPT ---
+        // Ye prompt aapke editing style ko copy karega.
         const prompt = `
-        You are an elite Audio Director.
+        You are an expert Audio Editor mimicking a specific human editing style.
         
-        GOAL: Edit a raw recording into a MASTERCLASS STORY.
+        INPUT ANALYSIS:
+        The user records multiple takes.
+        - Example: "Bhai kya... Bhai kya tum... Bhai kya tum bhi subah..."
         
-        CRITICAL INSTRUCTIONS:
-        1. **Semantic Selection:** If there are retakes, keep only the BEST, most confident version. Ignore stammers.
-        2. **Flow Detection (THE MAGIC):**
-           - For each segment, decide if the sentence ENDS there (Full stop) or FLOWS into the next (comma, "and", "but").
-           - Label each segment as "stop" or "flow".
-           - "stop": Sentence ends. Needs a breath pause.
-           - "flow": Sentence continues. Needs a tight cut.
+        YOUR JOB (Logic):
+        1. **Detect the "Winning Take":** Find the LAST, COMPLETE, and CONFIDENT version of each sentence.
+        2. **Discard Garbage:** Throw away all stammers, incomplete starts, and intermediate breaths.
+        3. **Waveform Sensitivity:** - Identify if a sentence ends with a "Full Stop" feel (needs a pause) or a "Comma" feel (needs quick flow).
+           - Mark them as "stop" or "flow".
+
+        STRICT RULES:
+        - Do not merge retakes. Pick ONE best version.
+        - If the user says "Garam nahi... Garam nahi...", keep the second one.
+        - Output strictly in DECIMAL SECONDS.
 
         FORMAT:
         { 
           "segments": [ 
-            {"start": 1.2, "end": 4.5, "type": "stop"}, 
-            {"start": 5.1, "end": 6.8, "type": "flow"}
+            {"start": 1.25, "end": 4.60, "type": "flow"}, 
+            {"start": 5.10, "end": 8.20, "type": "stop"}
           ] 
         }
         `;
 
-        console.log("[AI] Analyzing Flow & Context...");
+        console.log("[AI] Analyzing Waveform & Intent...");
         const result = await model.generateContent([
             prompt,
             { inlineData: { data: base64Audio, mimeType: "audio/mp3" } }
@@ -132,7 +135,7 @@ app.post('/process-audio', upload.single('audio'), async (req, res) => {
         try {
             segments = JSON.parse(jsonStr).segments;
         } catch (e) {
-            throw new Error("AI could not generate valid JSON.");
+            throw new Error("AI could not understand the editing logic.");
         }
 
         // Validate
@@ -140,30 +143,29 @@ app.post('/process-audio', upload.single('audio'), async (req, res) => {
             .map(s => ({ 
                 start: parseFloat(s.start), 
                 end: parseFloat(s.end),
-                type: s.type || 'stop' // Default to stop if undefined
+                type: s.type || 'stop' 
             }))
             .filter(s => !isNaN(s.start) && !isNaN(s.end) && s.end > s.start && s.start < totalDuration)
             .sort((a, b) => a.start - b.start);
 
         if (validSegments.length === 0) throw new Error("No usable segments found.");
 
-        // 2. Cutting (With Dynamic Logic)
-        console.log(`[Processing] Cutting ${validSegments.length} segments with Dynamic Flow...`);
+        // 2. Cutting (Applying Your Style)
+        console.log(`[Processing] Cutting ${validSegments.length} segments (Engineer Style)...`);
         
         for (let i = 0; i < validSegments.length; i++) {
             const seg = validSegments[i];
             const safeEnd = Math.min(seg.end, totalDuration);
-            // Pass the 'type' to the cutter function
             const chunkPath = await cutSegment(inputPath, seg.start, safeEnd, seg.type, i);
             chunkPaths.push(chunkPath);
         }
 
         // 3. Merging
-        console.log(`[Processing] Merging Masterclass...`);
+        console.log(`[Processing] Stitching Final Audio...`);
         await mergeChunks(chunkPaths, finalOutputPath);
 
-        console.log("✅ MASTERCLASS Editing Done!");
-        res.download(finalOutputPath, 'masterclass_audio.mp3', () => {
+        console.log("✅ Engineered Audio Ready!");
+        res.download(finalOutputPath, 'engineered_audio.mp3', () => {
             cleanup(inputPath, finalOutputPath, ...chunkPaths);
         });
 

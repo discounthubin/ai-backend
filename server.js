@@ -106,7 +106,7 @@ app.post('/process-audio', upload.single('audio'), async (req, res) => {
 
         const fileBuffer = fs.readFileSync(inputPath);
         const base64Audio = fileBuffer.toString('base64');
-        const model = genAI.getGenerativeModel({ model: "gemini-3-flash-preview" });
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
         // --- THE "DIRECTOR" PROMPT (Yours + Strict JSON) ---
         const prompt = `
